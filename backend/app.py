@@ -3,16 +3,29 @@ import json
 import time
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
+from flask_migrate import Migrate
 from werkzeug.utils import secure_filename
 import ollama
 from pypdf import PdfReader
-from docx import Document
+from docx import Document as DocxDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from models import db, Document, Conversation
+
 app = Flask(__name__)
 CORS(app)
+
+app.secret_key = os.environ.get("SESSION_SECRET") or "dev-secret-key-change-in-production"
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL")
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_recycle": 300,
+    "pool_pre_ping": True,
+}
+
+db.init_app(app)
+migrate = Migrate(app, db)
 
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf', 'docx', 'txt'}
@@ -23,7 +36,9 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-documents_store = {}
+with app.app_context():
+    db.create_all()
+
 rate_limit_store = defaultdict(list)
 RATE_LIMIT_REQUESTS = 30
 RATE_LIMIT_WINDOW = 60
@@ -63,7 +78,7 @@ def extract_text_from_pdf(file_path):
 
 def extract_text_from_docx(file_path):
     try:
-        doc = Document(file_path)
+        doc = DocxDocument(file_path)
         text_data = []
         current_section = 1
         current_text = []
@@ -204,17 +219,21 @@ def upload_file():
             text_data = extract_text_from_txt(file_path)
         
         chunks = chunk_text_smart(text_data, file_ext)
+        summary = generate_summary(text_data)
         
         doc_id = unique_filename
-        documents_store[doc_id] = {
-            'filename': filename,
-            'file_type': file_ext,
-            'chunks': chunks,
-            'raw_text_data': text_data,
-            'uploaded_at': timestamp
-        }
+        new_document = Document(
+            doc_id=doc_id,
+            filename=filename,
+            file_type=file_ext,
+            file_path=file_path,
+            summary=summary
+        )
+        new_document.set_chunks(chunks)
+        new_document.set_raw_text_data(text_data)
         
-        summary = generate_summary(text_data)
+        db.session.add(new_document)
+        db.session.commit()
         
         response_data = {
             'success': True,
@@ -233,28 +252,30 @@ def upload_file():
 
 @app.route('/api/documents', methods=['GET'])
 def get_documents():
-    docs = [{
-        'doc_id': doc_id,
-        'filename': data['filename'],
-        'file_type': data['file_type'],
-        'chunks_count': len(data['chunks'])
-    } for doc_id, data in documents_store.items()]
-    
-    docs.sort(key=lambda x: x['doc_id'], reverse=True)
-    
+    documents = Document.query.order_by(Document.uploaded_at.desc()).all()
+    docs = [doc.to_dict() for doc in documents]
     return jsonify({'documents': docs})
 
 @app.route('/api/document/<doc_id>', methods=['GET'])
 def get_document(doc_id):
-    if doc_id not in documents_store:
+    doc = Document.query.filter_by(doc_id=doc_id).first()
+    if not doc:
         return jsonify({'error': 'Document not found'}), 404
     
-    doc = documents_store[doc_id]
     return jsonify({
-        'filename': doc['filename'],
-        'file_type': doc['file_type'],
-        'text_data': doc['raw_text_data']
+        'filename': doc.filename,
+        'file_type': doc.file_type,
+        'text_data': doc.get_raw_text_data()
     })
+
+@app.route('/api/document/<doc_id>/conversations', methods=['GET'])
+def get_document_conversations(doc_id):
+    doc = Document.query.filter_by(doc_id=doc_id).first()
+    if not doc:
+        return jsonify({'error': 'Document not found'}), 404
+    
+    conversations = Conversation.query.filter_by(document_id=doc.id).order_by(Conversation.created_at.desc()).all()
+    return jsonify({'conversations': [conv.to_dict() for conv in conversations]})
 
 @app.route('/api/ask-stream', methods=['POST'])
 def ask_question_stream():
@@ -271,13 +292,13 @@ def ask_question_stream():
     if not question:
         return jsonify({'error': 'Question is required'}), 400
     
-    if not doc_id or doc_id not in documents_store:
+    doc = Document.query.filter_by(doc_id=doc_id).first()
+    if not doc:
         return jsonify({'error': 'Valid document ID is required'}), 400
     
     def generate():
         try:
-            doc = documents_store[doc_id]
-            chunks = doc['chunks']
+            chunks = doc.get_chunks()
             
             relevant_chunks = find_relevant_chunks_fast(question, chunks, model)
             
@@ -325,6 +346,8 @@ Answer:"""
             confidence = 'high' if len(relevant_chunks) >= 2 else 'medium'
             yield f"data: {json.dumps({'references': references, 'confidence': confidence})}\n\n"
             
+            full_answer = ""
+            
         except Exception as e:
             error_msg = str(e)
             if 'model' in error_msg.lower() or 'not found' in error_msg.lower():
@@ -348,7 +371,8 @@ def ask_multi_document():
     if not question:
         return jsonify({'error': 'Question is required'}), 400
     
-    if not documents_store:
+    documents = Document.query.all()
+    if not documents:
         return jsonify({'error': 'No documents available'}), 400
     
     def generate():
@@ -356,12 +380,12 @@ def ask_multi_document():
             all_chunks = []
             doc_sources = {}
             
-            for doc_id, doc in documents_store.items():
-                for chunk in doc['chunks']:
+            for doc in documents:
+                for chunk in doc.get_chunks():
                     chunk_with_source = chunk.copy()
-                    chunk_with_source['source'] = doc['filename']
+                    chunk_with_source['source'] = doc.filename
                     all_chunks.append(chunk_with_source)
-                    doc_sources[doc['filename']] = doc['file_type']
+                    doc_sources[doc.filename] = doc.file_type
             
             relevant_chunks = find_relevant_chunks_fast(question, all_chunks, model)
             
