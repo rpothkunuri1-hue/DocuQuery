@@ -15,6 +15,7 @@ function App() {
   const [status, setStatus] = useState(null);
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState('llama2');
+  const [highlightedRefs, setHighlightedRefs] = useState([]);
 
   useEffect(() => {
     fetchModels();
@@ -95,6 +96,7 @@ function App() {
     setActiveDoc(docId);
     fetchDocumentContent(docId);
     setMessages([]);
+    setHighlightedRefs([]);
   };
 
   const handleAskQuestion = async (e) => {
@@ -137,6 +139,7 @@ function App() {
       };
 
       setMessages([...messages, updatedMessage]);
+      setHighlightedRefs(response.data.references.map(ref => ref.metadata));
     } catch (error) {
       const errorMessage = error.response?.data?.error || 'Error processing question';
       setStatus({ type: 'error', message: errorMessage });
@@ -145,6 +148,27 @@ function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleMessageClick = (references) => {
+    if (references && references.length > 0) {
+      setHighlightedRefs(references.map(ref => ref.metadata));
+    }
+  };
+
+  const isHighlighted = (section) => {
+    return highlightedRefs.some(ref => {
+      if (ref.page && section.page) {
+        return ref.page === section.page;
+      }
+      if (ref.section && section.section) {
+        return ref.section === section.section;
+      }
+      if (ref.lines && section.lines) {
+        return ref.lines === section.lines;
+      }
+      return false;
+    });
   };
 
   const renderDocumentContent = () => {
@@ -163,16 +187,23 @@ function App() {
     return (
       <div className="document-content">
         <h3>{filename}</h3>
-        {text_data.map((section, idx) => (
-          <div key={idx} className="document-section">
-            <div className="section-label">
-              {file_type === 'pdf' && `Page ${section.page}`}
-              {file_type === 'docx' && `Section ${section.section}`}
-              {file_type === 'txt' && `Lines ${section.lines}`}
+        {text_data.map((section, idx) => {
+          const highlighted = isHighlighted(section);
+          return (
+            <div 
+              key={idx} 
+              className={`document-section ${highlighted ? 'highlighted' : ''}`}
+              id={`section-${file_type}-${section.page || section.section || section.lines}`}
+            >
+              <div className="section-label">
+                {file_type === 'pdf' && `Page ${section.page}`}
+                {file_type === 'docx' && `Section ${section.section}`}
+                {file_type === 'txt' && `Lines ${section.lines}`}
+              </div>
+              <div className="section-text">{section.text}</div>
             </div>
-            <div className="section-text">{section.text}</div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     );
   };
@@ -258,7 +289,11 @@ function App() {
               </div>
             ) : (
               messages.map((msg, idx) => (
-                <div key={idx} className="message">
+                <div 
+                  key={idx} 
+                  className="message"
+                  onClick={() => handleMessageClick(msg.references)}
+                >
                   <div className="message-question">
                     <div className="message-label">Question</div>
                     <div className="message-text">{msg.question}</div>
@@ -271,7 +306,7 @@ function App() {
                       </div>
                       {msg.references && msg.references.length > 0 && (
                         <div className="message-references">
-                          <div className="references-title">Referenced Sections</div>
+                          <div className="references-title">Referenced Sections (Click to highlight)</div>
                           {msg.references.map((ref, refIdx) => (
                             <div key={refIdx} className="reference-item">
                               <div className="reference-metadata">
